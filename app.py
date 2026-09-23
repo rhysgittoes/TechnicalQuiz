@@ -297,10 +297,13 @@ def get_results(voter=None):
         qid = q["id"]
         counts = {opt: 0 for opt in q["options"]}
         voters = {opt: [] for opt in q["options"]}
+        my_vote = None
         for row in conn.execute("SELECT voter, option FROM votes WHERE question_id=?", (qid,)):
             if row["option"] in counts:
                 counts[row["option"]] += 1
                 voters[row["option"]].append(row["voter"])
+                if voter and row["voter"] == voter:
+                    my_vote = row["option"]
 
         comments = []
         for c in conn.execute(
@@ -326,7 +329,7 @@ def get_results(voter=None):
                 "up": up, "down": down, "my_reaction": my_reaction,
             })
 
-        results[qid] = {"counts": counts, "voters": voters, "comments": comments}
+        results[qid] = {"counts": counts, "voters": voters, "comments": comments, "my_vote": my_vote}
     conn.close()
     return results
 
@@ -374,6 +377,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .bar { height: 100%; background: var(--accent2); }
   .count { font-size: 12px; color: var(--muted); min-width: 70px; text-align: right; }
   .voters { font-size: 11px; color: var(--muted); margin-left: 34px; margin-top: -2px; margin-bottom: 4px;}
+  .clearVoteLink { font-size: 12px; color: var(--muted); text-decoration: underline; cursor: pointer;
+    display: inline-block; margin-top: 4px; }
+  .clearVoteLink:hover { color: #ff6b6b; }
   details.comments { margin-top: 10px; }
   details.comments summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   .clist { margin: 8px 0; padding-left: 0; list-style: none; }
@@ -458,6 +464,23 @@ async function vote(qid, option) {
   refresh();
 }
 
+async function clearVote(qid) {
+  if (!myName) return;
+  delete myVotes[qid];
+  try {
+    const r = await fetch('/api/clear_vote', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question_id: qid, voter: myName})
+    });
+    if (!r.ok) throw new Error('clear failed');
+    setStatus('Vote cleared.');
+  } catch(e) {
+    setStatus('Could not clear vote - check connection.', true);
+  }
+  refresh();
+}
+
 async function addComment(qid) {
   if (!myName) { alert('Please set your name first'); return; }
   const input = document.getElementById('cin-' + qid);
@@ -489,6 +512,14 @@ async function refresh() {
     const url = '/api/results' + (myName ? ('?voter=' + encodeURIComponent(myName)) : '');
     const r = await fetch(url);
     latestResults = await r.json();
+    // The server knows the real current vote (or lack of one) per question -
+    // trust it, so a page reload or another tab stays in sync too.
+    if (myName) {
+      Object.keys(latestResults).forEach(qid => {
+        const mv = latestResults[qid].my_vote;
+        if (mv) { myVotes[qid] = mv; } else { delete myVotes[qid]; }
+      });
+    }
     render();
   } catch(e) { /* server might be briefly unreachable */ }
 }
@@ -566,6 +597,14 @@ function render() {
         div.appendChild(vsub);
       }
     });
+
+    if (myPick) {
+      const clearLink = document.createElement('div');
+      clearLink.className = 'clearVoteLink';
+      clearLink.textContent = 'Clear my vote';
+      clearLink.onclick = (e) => { e.stopPropagation(); clearVote(q.id); };
+      div.appendChild(clearLink);
+    }
 
     const details = document.createElement('details');
     details.className = 'comments';
@@ -737,6 +776,23 @@ class Handler(BaseHTTPRequestHandler):
                 conn.commit()
                 conn.close()
             log_event("vote", qid, voter, option, self.client_address[0])
+            self._send_json({"ok": True})
+
+        elif parsed.path == "/api/clear_vote":
+            qid = data.get("question_id")
+            voter = (data.get("voter") or "").strip()[:60]
+            if not qid or not voter:
+                self._send_json({"error": "invalid request"}, 400)
+                return
+            with db_lock:
+                conn = get_db()
+                conn.execute(
+                    "DELETE FROM votes WHERE question_id=? AND voter=?",
+                    (qid, voter),
+                )
+                conn.commit()
+                conn.close()
+            log_event("vote_cleared", qid, voter, "cleared", self.client_address[0])
             self._send_json({"ok": True})
 
         elif parsed.path == "/api/comment":
