@@ -243,6 +243,15 @@ def init_db():
             ts DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS comment_reactions (
+            comment_id INTEGER NOT NULL,
+            voter TEXT NOT NULL,
+            reaction TEXT NOT NULL CHECK (reaction IN ('up', 'down')),
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (comment_id, voter)
+        )
+    """)
     # audit_log is append-only: unlike "votes" (which only keeps each
     # person's latest answer), this keeps every vote/comment event ever
     # submitted, so you can see if someone changed their answer repeatedly
@@ -281,7 +290,7 @@ def log_event(event_type, question_id, voter, value, remote_addr=None):
         pass  # never let logging break the app
 
 
-def get_results():
+def get_results(voter=None):
     conn = get_db()
     results = {}
     for q in QUESTIONS:
@@ -292,12 +301,31 @@ def get_results():
             if row["option"] in counts:
                 counts[row["option"]] += 1
                 voters[row["option"]].append(row["voter"])
-        comments = [
-            {"voter": r["voter"], "comment": r["comment"]}
-            for r in conn.execute(
-                "SELECT voter, comment FROM comments WHERE question_id=? ORDER BY ts", (qid,)
-            )
-        ]
+
+        comments = []
+        for c in conn.execute(
+            "SELECT id, voter, comment FROM comments WHERE question_id=? ORDER BY ts", (qid,)
+        ):
+            up = conn.execute(
+                "SELECT COUNT(*) AS n FROM comment_reactions WHERE comment_id=? AND reaction='up'",
+                (c["id"],),
+            ).fetchone()["n"]
+            down = conn.execute(
+                "SELECT COUNT(*) AS n FROM comment_reactions WHERE comment_id=? AND reaction='down'",
+                (c["id"],),
+            ).fetchone()["n"]
+            my_reaction = None
+            if voter:
+                row = conn.execute(
+                    "SELECT reaction FROM comment_reactions WHERE comment_id=? AND voter=?",
+                    (c["id"], voter),
+                ).fetchone()
+                my_reaction = row["reaction"] if row else None
+            comments.append({
+                "id": c["id"], "voter": c["voter"], "comment": c["comment"],
+                "up": up, "down": down, "my_reaction": my_reaction,
+            })
+
         results[qid] = {"counts": counts, "voters": voters, "comments": comments}
     conn.close()
     return results
@@ -351,6 +379,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .clist { margin: 8px 0; padding-left: 0; list-style: none; }
   .clist li { background: var(--panel2); border-radius: 6px; padding: 6px 10px; margin-bottom: 6px; font-size: 13px;}
   .clist li b { color: var(--accent); }
+  .clist li { display:flex; align-items:center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .reactRow { display:flex; gap: 6px; flex-shrink: 0; }
+  .reactBtn { background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+    padding: 3px 8px; border-radius: 12px; cursor: pointer; font-size: 12px; }
+  .reactBtn:hover { border-color: var(--accent); }
+  .reactBtn.active-up { border-color: var(--accent2); color: var(--accent2); background: rgba(53,208,143,0.12); }
+  .reactBtn.active-down { border-color: #ff6b6b; color: #ff6b6b; background: rgba(255,107,107,0.12); }
   .caddrow { display:flex; gap: 8px; margin-top: 6px; }
   .caddrow input { flex:1; background: var(--panel2); border: 1px solid var(--border); color: var(--text);
     padding: 7px 10px; border-radius: 6px; font-size: 13px;}
@@ -451,10 +486,23 @@ let latestResults = {};
 
 async function refresh() {
   try {
-    const r = await fetch('/api/results');
+    const url = '/api/results' + (myName ? ('?voter=' + encodeURIComponent(myName)) : '');
+    const r = await fetch(url);
     latestResults = await r.json();
     render();
   } catch(e) { /* server might be briefly unreachable */ }
+}
+
+async function react(commentId, reaction) {
+  if (!myName) { alert('Please set your name first'); return; }
+  try {
+    await fetch('/api/react', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({comment_id: commentId, voter: myName, reaction: reaction})
+    });
+  } catch(e) {}
+  refresh();
 }
 
 function render() {
@@ -532,7 +580,24 @@ function render() {
     clist.className = 'clist';
     (res.comments || []).forEach(c => {
       const li = document.createElement('li');
-      li.innerHTML = '<b>' + c.voter.replace(/</g,'&lt;') + ':</b> ' + c.comment.replace(/</g,'&lt;');
+      const textSpan = document.createElement('span');
+      textSpan.innerHTML = '<b>' + c.voter.replace(/</g,'&lt;') + ':</b> ' + c.comment.replace(/</g,'&lt;');
+      li.appendChild(textSpan);
+
+      const reactRow = document.createElement('div');
+      reactRow.className = 'reactRow';
+      const upBtn = document.createElement('button');
+      upBtn.className = 'reactBtn' + (c.my_reaction === 'up' ? ' active-up' : '');
+      upBtn.textContent = '\U0001F44D ' + (c.up || 0);
+      upBtn.onclick = () => react(c.id, 'up');
+      const downBtn = document.createElement('button');
+      downBtn.className = 'reactBtn' + (c.my_reaction === 'down' ? ' active-down' : '');
+      downBtn.textContent = '\U0001F44E ' + (c.down || 0);
+      downBtn.onclick = () => react(c.id, 'down');
+      reactRow.appendChild(upBtn);
+      reactRow.appendChild(downBtn);
+      li.appendChild(reactRow);
+
       clist.appendChild(li);
     });
     details.appendChild(clist);
@@ -603,8 +668,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(PAGE_BYTES)
         elif parsed.path == "/api/results":
+            qs = parse_qs(parsed.query)
+            voter = (qs.get("voter") or [None])[0]
             with db_lock:
-                self._send_json(get_results())
+                self._send_json(get_results(voter=voter))
         elif parsed.path == "/api/questions":
             self._send_json(QUESTIONS)
         elif parsed.path == "/export":
@@ -689,6 +756,45 @@ class Handler(BaseHTTPRequestHandler):
                 conn.close()
             log_event("comment", qid, voter, comment, self.client_address[0])
             self._send_json({"ok": True})
+
+        elif parsed.path == "/api/react":
+            comment_id = data.get("comment_id")
+            voter = (data.get("voter") or "").strip()[:60]
+            reaction = (data.get("reaction") or "").strip().lower()
+            if not comment_id or not voter or reaction not in ("up", "down"):
+                self._send_json({"error": "invalid reaction"}, 400)
+                return
+            with db_lock:
+                conn = get_db()
+                crow = conn.execute("SELECT question_id FROM comments WHERE id=?", (comment_id,)).fetchone()
+                if not crow:
+                    conn.close()
+                    self._send_json({"error": "comment not found"}, 404)
+                    return
+                qid = crow["question_id"]
+                existing = conn.execute(
+                    "SELECT reaction FROM comment_reactions WHERE comment_id=? AND voter=?",
+                    (comment_id, voter),
+                ).fetchone()
+                if existing and existing["reaction"] == reaction:
+                    # Clicking the same reaction again clears it (toggle off).
+                    conn.execute(
+                        "DELETE FROM comment_reactions WHERE comment_id=? AND voter=?",
+                        (comment_id, voter),
+                    )
+                    final_value = "cleared"
+                else:
+                    conn.execute(
+                        "INSERT INTO comment_reactions (comment_id, voter, reaction) VALUES (?, ?, ?) "
+                        "ON CONFLICT(comment_id, voter) DO UPDATE SET reaction=excluded.reaction, ts=CURRENT_TIMESTAMP",
+                        (comment_id, voter, reaction),
+                    )
+                    final_value = reaction
+                conn.commit()
+                conn.close()
+            log_event("reaction", qid, voter, f"comment {comment_id}: {final_value}", self.client_address[0])
+            self._send_json({"ok": True})
+
         else:
             self.send_error(404)
 
