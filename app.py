@@ -26,6 +26,7 @@ import os
 
 PORT = int(os.environ.get("PORT", 8000))
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quiz_votes.db")
+AUDIT_TXT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit_log.txt")
 
 # ---------------------------------------------------------------------------
 # Question bank (A320 2026 Annual Technical Questionnaire)
@@ -242,8 +243,42 @@ def init_db():
             ts DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # audit_log is append-only: unlike "votes" (which only keeps each
+    # person's latest answer), this keeps every vote/comment event ever
+    # submitted, so you can see if someone changed their answer repeatedly
+    # or voted suspiciously. Also doubles as the backup export source.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+            event_type TEXT NOT NULL,
+            question_id INTEGER,
+            voter TEXT NOT NULL,
+            value TEXT NOT NULL,
+            remote_addr TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+
+def log_event(event_type, question_id, voter, value, remote_addr=None):
+    """Append one row to the audit_log table AND to a plain-text log file
+    next to the database, so there are two independent copies of the
+    history (handy if you just want to eyeball audit_log.txt directly)."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO audit_log (event_type, question_id, voter, value, remote_addr) VALUES (?, ?, ?, ?, ?)",
+        (event_type, question_id, voter, value, remote_addr),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        with open(AUDIT_TXT_PATH, "a", encoding="utf-8") as f:
+            ts = __import__("datetime").datetime.now().isoformat(timespec="seconds")
+            f.write(f"{ts}\t{event_type}\tQ{question_id}\t{voter}\t{value!r}\t{remote_addr or ''}\n")
+    except Exception:
+        pass  # never let logging break the app
 
 
 def get_results():
@@ -527,8 +562,41 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(get_results())
         elif parsed.path == "/api/questions":
             self._send_json(QUESTIONS)
+        elif parsed.path == "/export":
+            self._send_export_csv()
         else:
             self.send_error(404)
+
+    def _send_export_csv(self):
+        """Full history export: every vote and comment ever submitted, with
+        timestamps and the voter's IP, oldest first. This is the file to
+        download before redeploying (Render wipes the disk on deploy) and
+        the place to look for a 'dodgy voter' - e.g. someone flip-flopping
+        between answers, or many votes from the same IP under different
+        names."""
+        import csv
+        import io
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT ts, event_type, question_id, voter, value, remote_addr "
+            "FROM audit_log ORDER BY ts ASC"
+        ).fetchall()
+        conn.close()
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["timestamp", "event_type", "question_id", "voter", "value", "ip_address"])
+        for r in rows:
+            writer.writerow([r["ts"], r["event_type"], r["question_id"], r["voter"], r["value"], r["remote_addr"]])
+        body = buf.getvalue().encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="quiz_audit_export.csv"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -556,6 +624,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 conn.close()
+            log_event("vote", qid, voter, option, self.client_address[0])
             self._send_json({"ok": True})
 
         elif parsed.path == "/api/comment":
@@ -573,6 +642,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
                 conn.close()
+            log_event("comment", qid, voter, comment, self.client_address[0])
             self._send_json({"ok": True})
         else:
             self.send_error(404)
