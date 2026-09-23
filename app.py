@@ -368,7 +368,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div id="nameBox">
     <input id="nameInput" placeholder="Your name" maxlength="30">
-    <button onclick="setName()">Set name</button>
+    <button id="setNameBtn" onclick="setName()">Set name</button>
   </div>
 </header>
 <main>
@@ -383,11 +383,24 @@ const QUESTIONS = __QUESTIONS_JSON__;
 let myName = localStorage.getItem('quizVoterName') || '';
 let myVotes = {}; // questionId -> option, loaded from server responses indirectly (we track locally too)
 
+// Preserved across re-renders (so the 4s auto-refresh doesn't undo them):
+let openComments = {};   // questionId -> is the <details> open
+let commentDrafts = {};  // questionId -> whatever's currently typed but not yet posted
+
 function setName() {
   const v = document.getElementById('nameInput').value.trim();
   if (!v) { alert('Please enter a name'); return; }
   myName = v;
   localStorage.setItem('quizVoterName', v);
+
+  const btn = document.getElementById('setNameBtn');
+  btn.textContent = '\u2713 Saved as ' + v;
+  btn.disabled = true;
+  setTimeout(() => {
+    btn.textContent = 'Update name';
+    btn.disabled = false;
+  }, 1500);
+
   render();
 }
 
@@ -422,6 +435,7 @@ async function addComment(qid) {
       body: JSON.stringify({question_id: qid, voter: myName, comment: text})
     });
     input.value = '';
+    delete commentDrafts[qid];
   } catch(e) {}
   refresh();
 }
@@ -445,8 +459,20 @@ async function refresh() {
 
 function render() {
   document.getElementById('voterSub').textContent = myName ? ('Voting as: ' + myName) : 'Enter your name to vote';
-  document.getElementById('nameInput').value = myName;
+  const nameBtn = document.getElementById('setNameBtn');
+  if (!nameBtn.disabled) nameBtn.textContent = myName ? 'Update name' : 'Set name';
+  // Don't stomp on the name field while the user is actively editing it.
+  if (document.activeElement !== document.getElementById('nameInput')) {
+    document.getElementById('nameInput').value = myName;
+  }
   document.getElementById('lockedMsg').style.display = myName ? 'none' : 'block';
+
+  // Remember what's focused (and where the cursor is) so a comment box
+  // the user is mid-typing in doesn't lose focus/text on refresh.
+  const active = document.activeElement;
+  const activeId = active && active.id ? active.id : null;
+  const activeSelStart = active && 'selectionStart' in active ? active.selectionStart : null;
+  const activeSelEnd = active && 'selectionEnd' in active ? active.selectionEnd : null;
 
   const container = document.getElementById('questions');
   container.innerHTML = '';
@@ -495,6 +521,9 @@ function render() {
 
     const details = document.createElement('details');
     details.className = 'comments';
+    details.open = !!openComments[q.id];
+    details.addEventListener('toggle', () => { openComments[q.id] = details.open; });
+
     const summary = document.createElement('summary');
     summary.textContent = 'Comments (' + (res.comments ? res.comments.length : 0) + ')';
     details.appendChild(summary);
@@ -512,11 +541,27 @@ function render() {
     addrow.className = 'caddrow';
     addrow.innerHTML = '<input id="cin-' + q.id + '" placeholder="Add a comment...">' +
       '<button onclick="addComment(' + q.id + ')">Post</button>';
+    const cinput = addrow.querySelector('input');
+    cinput.value = commentDrafts[q.id] || '';
+    cinput.addEventListener('input', () => { commentDrafts[q.id] = cinput.value; });
+    cinput.addEventListener('keydown', e => { if (e.key === 'Enter') addComment(q.id); });
     details.appendChild(addrow);
 
     div.appendChild(details);
     container.appendChild(div);
   });
+
+  // Restore focus/cursor position that the rebuild above would otherwise
+  // have wiped (e.g. someone mid-typing a comment when the poll fires).
+  if (activeId) {
+    const toRefocus = document.getElementById(activeId);
+    if (toRefocus) {
+      toRefocus.focus();
+      if (activeSelStart !== null && 'setSelectionRange' in toRefocus) {
+        try { toRefocus.setSelectionRange(activeSelStart, activeSelEnd); } catch (e) {}
+      }
+    }
+  }
 }
 
 document.getElementById('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') setName(); });
