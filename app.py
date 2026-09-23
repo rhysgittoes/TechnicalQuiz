@@ -429,6 +429,7 @@ let openComments = {};   // questionId -> is the <details> open
 let commentDrafts = {};  // questionId -> whatever's currently typed but not yet posted
 
 function setName() {
+  if (myName) return; // already locked in, ignore
   const v = document.getElementById('nameInput').value.trim();
   if (!v) { alert('Please enter a name'); return; }
   myName = v;
@@ -437,10 +438,7 @@ function setName() {
   const btn = document.getElementById('setNameBtn');
   btn.textContent = '\u2713 Saved as ' + v;
   btn.disabled = true;
-  setTimeout(() => {
-    btn.textContent = 'Update name';
-    btn.disabled = false;
-  }, 1500);
+  document.getElementById('nameInput').disabled = true;
 
   render();
 }
@@ -537,12 +535,18 @@ async function react(commentId, reaction) {
 }
 
 function render() {
-  document.getElementById('voterSub').textContent = myName ? ('Voting as: ' + myName) : 'Enter your name to vote';
+  document.getElementById('voterSub').textContent = myName ? ('Voting as: ' + myName + ' (locked)') : 'Enter your name to vote';
   const nameBtn = document.getElementById('setNameBtn');
-  if (!nameBtn.disabled) nameBtn.textContent = myName ? 'Update name' : 'Set name';
-  // Don't stomp on the name field while the user is actively editing it.
-  if (document.activeElement !== document.getElementById('nameInput')) {
-    document.getElementById('nameInput').value = myName;
+  const nameInputEl = document.getElementById('nameInput');
+  if (myName) {
+    // Name is set for good once saved - no editing, no re-submitting.
+    nameBtn.textContent = '\u2713 Saved as ' + myName;
+    nameBtn.disabled = true;
+    nameInputEl.disabled = true;
+    nameInputEl.value = myName;
+  } else {
+    nameBtn.textContent = 'Set name';
+    nameBtn.disabled = false;
   }
   document.getElementById('lockedMsg').style.display = myName ? 'none' : 'block';
 
